@@ -20,9 +20,11 @@ pipeline {
         withCredentials([file(credentialsId: 'gcp-sa-key', variable: 'GCP_KEY_FILE')]) {
           sh '''
             set -e
-            gcloud auth activate-service-account --key-file="$GCP_KEY_FILE"
-            gcloud config set project "${PROJECT_ID}"
-            gcloud auth configure-docker "${REGION}-docker.pkg.dev" -q
+            TS=$(date "+%Y%m%d-%H%M%S")
+            echo "[$(date "+%Y-%m-%d %H:%M:%S%z")] gcloud auth start" | tee "auth-${TS}.log"
+            gcloud auth activate-service-account --key-file="$GCP_KEY_FILE" | tee -a "auth-${TS}.log"
+            gcloud config set project "${PROJECT_ID}" | tee -a "auth-${TS}.log"
+            gcloud auth configure-docker "${REGION}-docker.pkg.dev" -q | tee -a "auth-${TS}.log"
           '''
         }
       }
@@ -32,10 +34,11 @@ pipeline {
       steps {
         sh '''
           set -e
-          echo "[BUILD] ${IMAGE}"
-          docker build -t "${IMAGE}" ./app
-          echo "[PUSH] ${IMAGE}"
-          docker push "${IMAGE}"
+          TS=$(date "+%Y%m%d-%H%M%S")
+          echo "[$(date "+%Y-%m-%d %H:%M:%S%z")] BUILD ${IMAGE}" | tee "build-${TS}.log"
+          docker build -t "${IMAGE}" ./app 2>&1 | tee -a "build-${TS}.log"
+          echo "[$(date "+%Y-%m-%d %H:%M:%S%z")] PUSH ${IMAGE}" | tee "push-${TS}.log"
+          docker push "${IMAGE}" 2>&1 | tee -a "push-${TS}.log"
         '''
       }
     }
@@ -44,7 +47,9 @@ pipeline {
       steps {
         sh '''
           set -e
-          gcloud container clusters get-credentials "${CLUSTER_NAME}" --zone "${ZONE}"
+          TS=$(date "+%Y%m%d-%H%M%S")
+          echo "[$(date "+%Y-%m-%d %H:%M:%S%z")] get-credentials ${CLUSTER_NAME}/${ZONE}" | tee "kube-${TS}.log"
+          gcloud container clusters get-credentials "${CLUSTER_NAME}" --zone "${ZONE}" 2>&1 | tee -a "kube-${TS}.log"
         '''
       }
     }
@@ -53,34 +58,43 @@ pipeline {
       steps {
         sh '''
           set -e
+          TS=$(date "+%Y%m%d-%H%M%S")
+          echo "[$(date "+%Y-%m-%d %H:%M:%S%z")] render deployment with IMAGE=${IMAGE}" | tee "deploy-${TS}.log"
           export IMAGE="${IMAGE}"
-          # deployment.yaml içinde image: ${IMAGE} beklenir
           envsubst < k8s/deployment.yaml > "${RENDERED_DEPLOY}"
 
-          kubectl -n "${NAMESPACE}" apply -f "${RENDERED_DEPLOY}"
-          kubectl -n "${NAMESPACE}" apply -f k8s/ingress.yaml
+          echo "[$(date "+%Y-%m-%d %H:%M:%S%z")] kubectl apply deployment" | tee -a "deploy-${TS}.log"
+          kubectl -n "${NAMESPACE}" apply -f "${RENDERED_DEPLOY}" 2>&1 | tee -a "deploy-${TS}.log"
 
+          echo "[$(date "+%Y-%m-%d %H:%M:%S%z")] kubectl apply ingress" | tee -a "deploy-${TS}.log"
+          kubectl -n "${NAMESPACE}" apply -f k8s/ingress.yaml 2>&1 | tee -a "deploy-${TS}.log"
+
+          echo "[$(date "+%Y-%m-%d %H:%M:%S%z")] annotate change-cause" | tee -a "deploy-${TS}.log"
           kubectl -n "${NAMESPACE}" annotate deploy/fastapi-demo \
-            kubernetes.io/change-cause="Release ${IMAGE}" --overwrite
+            kubernetes.io/change-cause="Release ${IMAGE}" --overwrite 2>&1 | tee -a "deploy-${TS}.log"
 
-          kubectl -n "${NAMESPACE}" rollout status deploy/fastapi-demo --timeout=300s
+          echo "[$(date "+%Y-%m-%d %H:%M:%S%z")] rollout status" | tee -a "deploy-${TS}.log"
+          kubectl -n "${NAMESPACE}" rollout status deploy/fastapi-demo --timeout=300s 2>&1 | tee -a "deploy-${TS}.log"
         '''
       }
     }
 
-    stage('Proof (timestamped)') {
+    stage('Proof (timestamped outputs)') {
       steps {
         sh '''
           set -e
           TS=$(date "+%Y%m%d-%H%M%S")
+          echo "[$(date "+%Y-%m-%d %H:%M:%S%z")] fetching Ingress IP" | tee "proof-${TS}.log"
           EXT_IP=$(kubectl -n "${NAMESPACE}" get ing fastapi-ing -o jsonpath='{.status.loadBalancer.ingress[0].ip}' || true)
-          echo "[$(date "+%Y-%m-%d %H:%M:%S%z")] EXT_IP=${EXT_IP}" | tee "deploy-proof-${TS}.log"
+          echo "EXT_IP=${EXT_IP}" | tee -a "proof-${TS}.log"
 
           if [ -n "$EXT_IP" ]; then
+            echo "[$(date "+%Y-%m-%d %H:%M:%S%z")] curl /" | tee -a "proof-${TS}.log"
             curl -s "http://$EXT_IP/"         | tee "app-proof-${TS}.html" >/dev/null
+            echo "[$(date "+%Y-%m-%d %H:%M:%S%z")] curl /healthz" | tee -a "proof-${TS}.log"
             curl -si "http://$EXT_IP/healthz" | tee "app-health-${TS}.log" >/dev/null
           else
-            echo "Ingress IP not ready yet" | tee -a "deploy-proof-${TS}.log"
+            echo "Ingress IP not ready yet" | tee -a "proof-${TS}.log"
           fi
         '''
       }
@@ -89,7 +103,7 @@ pipeline {
 
   post {
     always {
-      archiveArtifacts artifacts: 'k8s/_rendered-deployment.yaml,**/*.log,**/*.html', onlyIfSuccessful: false
+      archiveArtifacts artifacts: 'k8s/_rendered-deployment.yaml,*.log,*.html', onlyIfSuccessful: false
     }
   }
 }
